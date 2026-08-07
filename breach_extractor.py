@@ -284,19 +284,79 @@ def iter_paragraph_runs(paragraph_element: ET.Element) -> Iterable[ET.Element]:
 
 def parse_table_block(table_element: ET.Element) -> TableBlock:
     rows: List[List[str]] = []
+    grid_width = detect_table_grid_width(table_element)
     for row_element in table_element.findall("./w:tr", NS):
-        row: List[str] = []
-        for cell_element in row_element.findall("./w:tc", NS):
-            paragraphs = []
-            for paragraph_element in cell_element.findall(".//w:p", NS):
-                paragraph = parse_paragraph_block(paragraph_element)
-                if paragraph.text:
-                    paragraphs.append(paragraph.text)
-            cell_text = "\n".join(paragraphs).strip()
-            row.append(cell_text)
+        row = parse_table_row(row_element, grid_width)
         if any(normalize_inline(cell) for cell in row):
             rows.append(row)
     return TableBlock(rows=rows)
+
+
+def detect_table_grid_width(table_element: ET.Element) -> int:
+    grid_columns = table_element.findall("./w:tblGrid/w:gridCol", NS)
+    if grid_columns:
+        return len(grid_columns)
+
+    estimated_width = 0
+    for row_element in table_element.findall("./w:tr", NS):
+        estimated_width = max(estimated_width, estimate_row_grid_width(row_element))
+    return estimated_width
+
+
+def estimate_row_grid_width(row_element: ET.Element) -> int:
+    width = extract_row_grid_offset(row_element, "gridBefore")
+    for cell_element in row_element.findall("./w:tc", NS):
+        width += extract_grid_span(cell_element)
+    width += extract_row_grid_offset(row_element, "gridAfter")
+    return width
+
+
+def parse_table_row(row_element: ET.Element, grid_width: int) -> List[str]:
+    row: List[str] = [""] * extract_row_grid_offset(row_element, "gridBefore")
+
+    for cell_element in row_element.findall("./w:tc", NS):
+        cell_text = extract_cell_text(cell_element)
+        span = extract_grid_span(cell_element)
+        row.append(cell_text)
+        if span > 1:
+            row.extend([""] * (span - 1))
+
+    row.extend([""] * extract_row_grid_offset(row_element, "gridAfter"))
+    if grid_width and len(row) < grid_width:
+        row.extend([""] * (grid_width - len(row)))
+    return row
+
+
+def extract_row_grid_offset(row_element: ET.Element, tag_name: str) -> int:
+    offset_element = row_element.find("./w:trPr/w:%s" % tag_name, NS)
+    if offset_element is None:
+        return 0
+    return parse_int_value(offset_element.get(W_VAL), default=0)
+
+
+def extract_grid_span(cell_element: ET.Element) -> int:
+    span_element = cell_element.find("./w:tcPr/w:gridSpan", NS)
+    if span_element is None:
+        return 1
+    return max(1, parse_int_value(span_element.get(W_VAL), default=1))
+
+
+def extract_cell_text(cell_element: ET.Element) -> str:
+    paragraphs = []
+    for paragraph_element in cell_element.findall(".//w:p", NS):
+        paragraph = parse_paragraph_block(paragraph_element)
+        if paragraph.text:
+            paragraphs.append(paragraph.text)
+    return "\n".join(paragraphs).strip()
+
+
+def parse_int_value(value: Optional[str], default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def extract_run_text(run_element: ET.Element) -> str:
@@ -559,6 +619,7 @@ def extract_model_affected_values(
         "model_ids": "",
         "model_names": "",
     }
+    embedded_risk_rating = extract_embedded_label_value(row, "model(s) affected")
 
     # Preferred path: use the actual header columns from the table.
     if model_column_map:
@@ -570,18 +631,25 @@ def extract_model_affected_values(
                 else:
                     extracted[field_name] = collapse_multivalue_cell(value)
 
+        if not extracted["model_risk_rating"] and embedded_risk_rating:
+            extracted["model_risk_rating"] = normalize_scalar(embedded_risk_rating)
+
         if any(extracted.values()):
             return extracted
 
-    # Fallback path: preserve the original position-based behavior.
-    values = non_label_cells(row, "model(s) affected")
-    if len(values) >= 1:
+    # Conservative fallback: only populate when the values clearly look like
+    # the A-layout columns. For B-layout legacy tables we leave these blank.
+    values = []
+    if embedded_risk_rating:
+        values.append(embedded_risk_rating)
+    values.extend(non_label_cells(row, "model(s) affected"))
+
+    if len(values) >= 3 and looks_like_risk_rating(values[0]) and looks_like_model_id(values[1]):
         extracted["model_risk_rating"] = normalize_scalar(values[0])
-    if len(values) >= 2:
         extracted["model_ids"] = collapse_multivalue_cell(values[1])
-    if len(values) >= 3:
         extracted["model_names"] = collapse_multivalue_cell(values[2])
-    elif len(values) == 2 and not extracted["model_names"]:
+    elif len(values) >= 2 and looks_like_model_id(values[0]):
+        extracted["model_ids"] = collapse_multivalue_cell(values[0])
         extracted["model_names"] = collapse_multivalue_cell(values[1])
 
     return extracted
@@ -659,6 +727,30 @@ def non_label_cells(row: List[str], label: str) -> List[str]:
     return values
 
 
+def extract_embedded_label_value(row: List[str], label: str) -> str:
+    label_lower = label.lower()
+    for cell in row:
+        cleaned = clean_multiline_text(cell)
+        if not cleaned:
+            continue
+        lines = cleaned.splitlines()
+        first_line = normalize_inline(lines[0])
+        if label_lower not in first_line.lower():
+            continue
+
+        residual_lines: List[str] = []
+        first_line_without_label = re.sub(re.escape(label), "", first_line, flags=re.IGNORECASE)
+        first_line_without_label = first_line_without_label.strip(" :\t")
+        if first_line_without_label:
+            residual_lines.append(first_line_without_label)
+        residual_lines.extend(lines[1:])
+        residual_lines = [normalize_scalar(line) for line in residual_lines]
+        residual_lines = [line for line in residual_lines if line]
+        if residual_lines:
+            return " | ".join(residual_lines)
+    return ""
+
+
 def normalize_severity_text(value: str) -> str:
     cleaned = re.split(r"\s*\[", value, maxsplit=1)[0]
     return normalize_inline(cleaned)
@@ -674,6 +766,16 @@ def looks_like_severity_value(value: str) -> bool:
         "temporary condition",
     )
     return len(normalized) <= 120 and any(keyword in lowered for keyword in severity_keywords)
+
+
+def looks_like_risk_rating(value: str) -> bool:
+    lowered = normalize_inline(value).lower()
+    return lowered in {"low", "medium", "high"}
+
+
+def looks_like_model_id(value: str) -> bool:
+    normalized = normalize_inline(value).upper()
+    return normalized.startswith("MOD_")
 
 
 def classify_record_status(paragraph: ParagraphBlock) -> str:
@@ -739,7 +841,7 @@ def collapse_multivalue_cell(value: str) -> str:
 
 
 def write_csv(records: List[Dict[str, str]], output_path: Path) -> None:
-    with output_path.open("w", encoding="utf-8", newline="") as handle:
+    with output_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
         writer.writeheader()
         for record in records:
