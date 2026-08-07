@@ -45,6 +45,7 @@ PLACEHOLDER_PREFIXES = (
 )
 BLACK_THEME_COLORS = {"text1", "tx1", "dark1", "dk1"}
 BLACK_COLOR_VALUES = {"000000", "000001", "auto"}
+MODEL_ID_TOKEN_RE = re.compile(r"\bMOD_[A-Z0-9_]+\b", re.IGNORECASE)
 OUTPUT_COLUMNS = [
     "group_name",
     "chunk_number",
@@ -619,26 +620,17 @@ def extract_model_affected_values(
         "model_ids": "",
         "model_names": "",
     }
-    embedded_risk_rating = extract_embedded_label_value(row, "model(s) affected")
 
-    # Preferred path: use the actual header columns from the table.
+    # Preferred path: if the A-layout header exists, classify the values in the
+    # row by content instead of trusting physical cell offsets.
     if model_column_map:
-        for field_name, column_index in model_column_map.items():
-            if column_index < len(row):
-                value = row[column_index]
-                if field_name == "model_risk_rating":
-                    extracted[field_name] = normalize_scalar(value)
-                else:
-                    extracted[field_name] = collapse_multivalue_cell(value)
-
-        if not extracted["model_risk_rating"] and embedded_risk_rating:
-            extracted["model_risk_rating"] = normalize_scalar(embedded_risk_rating)
-
+        extracted.update(extract_model_affected_semantic(row))
         if any(extracted.values()):
             return extracted
 
     # Conservative fallback: only populate when the values clearly look like
     # the A-layout columns. For B-layout legacy tables we leave these blank.
+    embedded_risk_rating = extract_embedded_label_value(row, "model(s) affected")
     values = []
     if embedded_risk_rating:
         values.append(embedded_risk_rating)
@@ -653,6 +645,40 @@ def extract_model_affected_values(
         extracted["model_names"] = collapse_multivalue_cell(values[1])
 
     return extracted
+
+
+def extract_model_affected_semantic(row: List[str]) -> Dict[str, str]:
+    risk_rating = ""
+    model_ids: List[str] = []
+    model_names: List[str] = []
+
+    for cell in row:
+        for piece in split_model_affected_cell_values(cell):
+            if not piece:
+                continue
+            if looks_like_risk_rating(piece):
+                if not risk_rating:
+                    risk_rating = normalize_scalar(piece)
+                continue
+
+            id_tokens = extract_model_id_tokens(piece)
+            if id_tokens:
+                for token in id_tokens:
+                    if token not in model_ids:
+                        model_ids.append(token)
+                residual_name = remove_model_id_tokens(piece)
+                if residual_name and residual_name not in model_names:
+                    model_names.append(residual_name)
+                continue
+
+            if piece not in model_names:
+                model_names.append(piece)
+
+    return {
+        "model_risk_rating": risk_rating,
+        "model_ids": " | ".join(model_ids),
+        "model_names": " | ".join(model_names),
+    }
 
 
 def extract_breach_dates(header_row: List[str], value_row: List[str]) -> Dict[str, str]:
@@ -749,6 +775,40 @@ def extract_embedded_label_value(row: List[str], label: str) -> str:
         if residual_lines:
             return " | ".join(residual_lines)
     return ""
+
+
+def split_model_affected_cell_values(cell_text: str) -> List[str]:
+    cleaned = clean_multiline_text(cell_text)
+    if not cleaned:
+        return []
+
+    lines = [normalize_scalar(line) for line in cleaned.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return []
+
+    first_line = lines[0]
+    if "model(s) affected" in first_line.lower():
+        first_line_without_label = re.sub(
+            re.escape("model(s) affected"), "", first_line, flags=re.IGNORECASE
+        )
+        first_line_without_label = first_line_without_label.strip(" :\t")
+        adjusted_lines: List[str] = []
+        if first_line_without_label:
+            adjusted_lines.append(first_line_without_label)
+        adjusted_lines.extend(lines[1:])
+        lines = adjusted_lines
+
+    return [line for line in lines if line]
+
+
+def extract_model_id_tokens(value: str) -> List[str]:
+    return [token.upper() for token in MODEL_ID_TOKEN_RE.findall(value or "")]
+
+
+def remove_model_id_tokens(value: str) -> str:
+    without_ids = MODEL_ID_TOKEN_RE.sub(" ", value or "")
+    return normalize_inline(without_ids)
 
 
 def normalize_severity_text(value: str) -> str:
