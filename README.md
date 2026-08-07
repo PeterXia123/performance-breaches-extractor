@@ -57,8 +57,9 @@ One `Severity of Breach Identified:` chunk becomes one output record.
 
 ## Current limitation
 
-This version only works on a **real text-based DOCX** where Word paragraphs and tables are
-present in the document XML.
+This version works on a **real text-based DOCX** where Word paragraphs and tables are
+present in the document XML. It also handles common nested Word structures such as
+text boxes that still store normal paragraph/table content in OOXML.
 
 It does **not** extract data from:
 

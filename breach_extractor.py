@@ -25,6 +25,7 @@ W_CR = "{%s}cr" % WORD_NS
 W_COLOR = "{%s}color" % WORD_NS
 W_VAL = "{%s}val" % WORD_NS
 W_THEME_COLOR = "{%s}themeColor" % WORD_NS
+W_TXBX_CONTENT = "{%s}txbxContent" % WORD_NS
 
 SEVERITY_RE = re.compile(
     r"^\s*(?P<number>\d+)\.\s*Severity of Breach Identified:\s*(?P<severity>.+?)\s*$",
@@ -125,6 +126,15 @@ def main() -> None:
     print("Wrote %s" % csv_path)
     print("Wrote %s" % json_path)
     print("Extracted %d breach record(s)" % len(records))
+    if not records:
+        print(
+            (
+                "Warning: no breach records were found. "
+                "This can happen when the document stores content inside "
+                "images or unsupported Word objects."
+            ),
+            file=sys.stderr,
+        )
 
 
 def extract_breach_records(docx_path: Path) -> List[Dict[str, str]]:
@@ -144,19 +154,37 @@ def parse_docx_blocks(docx_path: Path) -> List[object]:
     if body is None:
         return []
 
+    return collect_blocks(body)
+
+
+def collect_blocks(container: ET.Element) -> List[object]:
     blocks: List[object] = []
-    for child in list(body):
-        if child.tag == W_P:
-            blocks.append(parse_paragraph_block(child))
-        elif child.tag == W_TBL:
+    for child in list(container):
+        if child.tag == W_TBL:
             blocks.append(parse_table_block(child))
+            continue
+
+        if child.tag == W_P:
+            paragraph = parse_paragraph_block(child)
+            blocks.append(paragraph)
+            blocks.extend(extract_textbox_blocks(child))
+            continue
+
+        blocks.extend(collect_blocks(child))
+    return blocks
+
+
+def extract_textbox_blocks(paragraph_element: ET.Element) -> List[object]:
+    blocks: List[object] = []
+    for textbox_content in paragraph_element.iter(W_TXBX_CONTENT):
+        blocks.extend(collect_blocks(textbox_content))
     return blocks
 
 
 def parse_paragraph_block(paragraph_element: ET.Element) -> ParagraphBlock:
     runs: List[RunInfo] = []
     parts: List[str] = []
-    for run_element in paragraph_element.iter(W_R):
+    for run_element in iter_paragraph_runs(paragraph_element):
         text = extract_run_text(run_element)
         if not text:
             continue
@@ -171,6 +199,17 @@ def parse_paragraph_block(paragraph_element: ET.Element) -> ParagraphBlock:
 
     text = clean_multiline_text("".join(parts))
     return ParagraphBlock(text=text, runs=runs)
+
+
+def iter_paragraph_runs(paragraph_element: ET.Element) -> Iterable[ET.Element]:
+    for child in list(paragraph_element):
+        if child.tag == W_R:
+            yield child
+            continue
+        if child.tag in (W_P, W_TBL):
+            continue
+        for run_element in iter_paragraph_runs(child):
+            yield run_element
 
 
 def parse_table_block(table_element: ET.Element) -> TableBlock:
