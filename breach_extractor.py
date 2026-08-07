@@ -208,7 +208,7 @@ def collect_blocks(container: ET.Element) -> List[object]:
     blocks: List[object] = []
     for child in list(container):
         if child.tag == W_TBL:
-            blocks.append(parse_table_block(child))
+            blocks.extend(collect_blocks_from_table(child))
             continue
 
         if child.tag == W_P:
@@ -218,6 +218,25 @@ def collect_blocks(container: ET.Element) -> List[object]:
             continue
 
         blocks.extend(collect_blocks(child))
+    return blocks
+
+
+def collect_blocks_from_table(table_element: ET.Element) -> List[object]:
+    blocks: List[object] = []
+    for row_element in table_element.findall("./w:tr", NS):
+        for cell_element in row_element.findall("./w:tc", NS):
+            for child in list(cell_element):
+                if child.tag == W_P:
+                    paragraph = parse_paragraph_block(child)
+                    blocks.append(paragraph)
+                    blocks.extend(extract_textbox_blocks(child))
+                    continue
+                if child.tag == W_TBL:
+                    blocks.extend(collect_blocks_from_table(child))
+                    continue
+                blocks.extend(collect_blocks(child))
+
+    blocks.append(parse_table_block(table_element))
     return blocks
 
 
@@ -325,6 +344,34 @@ def build_records_from_blocks(blocks: Iterable[object]) -> List[Dict[str, str]]:
                 continue
 
         elif isinstance(block, TableBlock):
+            row_texts = [normalize_inline(" ".join(row)) for row in block.rows]
+
+            for row_text in row_texts:
+                if not row_text:
+                    continue
+
+                if not in_breach_section and "performance breaches:" in row_text.lower():
+                    in_breach_section = True
+
+                if not in_breach_section:
+                    continue
+
+                if GROUP_RE.match(row_text):
+                    current_group = row_text
+                    continue
+
+                severity_match = SEVERITY_RE.match(row_text)
+                if severity_match:
+                    if current_chunk is not None:
+                        records.append(finalize_chunk(current_chunk))
+                    current_chunk = {
+                        "group_name": current_group,
+                        "chunk_number": severity_match.group("number"),
+                        "severity_raw": normalize_severity_text(severity_match.group("severity")),
+                        "record_status": "active",
+                        "table": block.rows,
+                    }
+
             if in_breach_section and current_chunk is not None and current_chunk.get("table") is None:
                 current_chunk["table"] = block.rows
 
