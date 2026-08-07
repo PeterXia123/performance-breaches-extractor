@@ -315,19 +315,22 @@ def extract_fields_from_table(rows: List[List[str]]) -> Dict[str, str]:
         "remediation_date": "",
     }
 
-    for row in rows:
+    model_header_index = find_model_header_row_index(rows)
+    model_column_map = {}
+    if model_header_index != -1:
+        model_column_map = build_model_column_map(rows[model_header_index])
+
+    for row_index, row in enumerate(rows):
         row_lower = [normalize_inline(cell).lower() for cell in row]
 
         if any("model(s) affected" in cell for cell in row_lower):
-            values = non_label_cells(row, "model(s) affected")
-            if len(values) >= 1:
-                extracted["model_risk_rating"] = normalize_scalar(values[0])
-            if len(values) >= 2:
-                extracted["model_ids"] = collapse_multivalue_cell(values[1])
-            if len(values) >= 3:
-                extracted["model_names"] = collapse_multivalue_cell(values[2])
-            elif len(values) == 2 and not extracted["model_names"]:
-                extracted["model_names"] = collapse_multivalue_cell(values[1])
+            extracted.update(
+                extract_model_affected_values(
+                    row=row,
+                    row_index=row_index,
+                    model_column_map=model_column_map,
+                )
+            )
 
         if any("explanation of breach" in cell for cell in row_lower):
             values = non_label_cells(row, "explanation of breach")
@@ -344,6 +347,64 @@ def extract_fields_from_table(rows: List[List[str]]) -> Dict[str, str]:
         label_row = rows[plan_row_index]
         value_row = rows[plan_row_index + 1] if plan_row_index + 1 < len(rows) else []
         extracted.update(extract_plan_and_remediation(label_row, value_row))
+
+    return extracted
+
+
+def find_model_header_row_index(rows: List[List[str]]) -> int:
+    required = ("model risk rating", "model id", "model name")
+    for index, row in enumerate(rows):
+        normalized = [normalize_inline(cell).lower() for cell in row]
+        if all(any(required_text in cell for cell in normalized) for required_text in required):
+            return index
+    return -1
+
+
+def build_model_column_map(header_row: List[str]) -> Dict[str, int]:
+    column_map: Dict[str, int] = {}
+    for index, cell in enumerate(header_row):
+        label = normalize_inline(cell).lower()
+        if "model risk rating" in label:
+            column_map["model_risk_rating"] = index
+        elif "model id" in label:
+            column_map["model_ids"] = index
+        elif "model name" in label:
+            column_map["model_names"] = index
+    return column_map
+
+
+def extract_model_affected_values(
+    row: List[str], row_index: int, model_column_map: Dict[str, int]
+) -> Dict[str, str]:
+    extracted = {
+        "model_risk_rating": "",
+        "model_ids": "",
+        "model_names": "",
+    }
+
+    # Preferred path: use the actual header columns from the table.
+    if model_column_map:
+        for field_name, column_index in model_column_map.items():
+            if column_index < len(row):
+                value = row[column_index]
+                if field_name == "model_risk_rating":
+                    extracted[field_name] = normalize_scalar(value)
+                else:
+                    extracted[field_name] = collapse_multivalue_cell(value)
+
+        if any(extracted.values()):
+            return extracted
+
+    # Fallback path: preserve the original position-based behavior.
+    values = non_label_cells(row, "model(s) affected")
+    if len(values) >= 1:
+        extracted["model_risk_rating"] = normalize_scalar(values[0])
+    if len(values) >= 2:
+        extracted["model_ids"] = collapse_multivalue_cell(values[1])
+    if len(values) >= 3:
+        extracted["model_names"] = collapse_multivalue_cell(values[2])
+    elif len(values) == 2 and not extracted["model_names"]:
+        extracted["model_names"] = collapse_multivalue_cell(values[1])
 
     return extracted
 
