@@ -29,7 +29,11 @@ W_THEME_COLOR = "{%s}themeColor" % WORD_NS
 W_TXBX_CONTENT = "{%s}txbxContent" % WORD_NS
 
 SEVERITY_RE = re.compile(
-    r"^\s*(?P<number>\d+)\.\s*Severity of Breach Identified:\s*(?P<severity>.+?)\s*$",
+    r"^\s*(?:(?P<number>\d+)\.\s*)?Severity of Breach Identified\s*:?\s*(?P<severity>.+?)\s*$",
+    re.IGNORECASE,
+)
+SEVERITY_LABEL_ONLY_RE = re.compile(
+    r"^\s*(?:(?P<number>\d+)\.\s*)?Severity of Breach Identified\s*:?\s*$",
     re.IGNORECASE,
 )
 GROUP_RE = re.compile(r"^[A-Za-z0-9&/\- ,()]+ Models$", re.IGNORECASE)
@@ -312,6 +316,37 @@ def build_records_from_blocks(blocks: Iterable[object]) -> List[Dict[str, str]]:
     current_group = ""
     current_chunk: Optional[Dict[str, object]] = None
     in_breach_section = False
+    chunk_sequence = 0
+    pending_severity: Optional[Dict[str, str]] = None
+
+    def make_chunk_number(explicit_number: Optional[str]) -> str:
+        nonlocal chunk_sequence
+        if explicit_number:
+            try:
+                chunk_sequence = max(chunk_sequence, int(explicit_number))
+            except ValueError:
+                pass
+            return explicit_number
+
+        chunk_sequence += 1
+        return str(chunk_sequence)
+
+    def start_chunk(
+        explicit_number: Optional[str],
+        severity_text: str,
+        record_status: str,
+        table_rows: Optional[List[List[str]]] = None,
+    ) -> None:
+        nonlocal current_chunk
+        if current_chunk is not None:
+            records.append(finalize_chunk(current_chunk))
+        current_chunk = {
+            "group_name": current_group,
+            "chunk_number": make_chunk_number(explicit_number),
+            "severity_raw": normalize_severity_text(severity_text),
+            "record_status": record_status,
+            "table": table_rows,
+        }
 
     for block in blocks:
         if isinstance(block, ParagraphBlock):
@@ -326,21 +361,38 @@ def build_records_from_blocks(blocks: Iterable[object]) -> List[Dict[str, str]]:
             if not in_breach_section:
                 continue
 
+            label_only_match = SEVERITY_LABEL_ONLY_RE.match(text)
+            if label_only_match:
+                pending_severity = {
+                    "number": label_only_match.group("number") or "",
+                    "record_status": classify_record_status(block),
+                }
+                continue
+
+            if pending_severity is not None and looks_like_severity_value(text):
+                start_chunk(
+                    pending_severity.get("number") or None,
+                    text,
+                    pending_severity.get("record_status") or "active",
+                    None,
+                )
+                pending_severity = None
+                continue
+
             severity_match = SEVERITY_RE.match(text)
             if severity_match:
-                if current_chunk is not None:
-                    records.append(finalize_chunk(current_chunk))
-                current_chunk = {
-                    "group_name": current_group,
-                    "chunk_number": severity_match.group("number"),
-                    "severity_raw": normalize_severity_text(severity_match.group("severity")),
-                    "record_status": classify_record_status(block),
-                    "table": None,
-                }
+                start_chunk(
+                    severity_match.group("number"),
+                    severity_match.group("severity"),
+                    classify_record_status(block),
+                    None,
+                )
+                pending_severity = None
                 continue
 
             if GROUP_RE.match(text):
                 current_group = text
+                pending_severity = None
                 continue
 
         elif isinstance(block, TableBlock):
@@ -358,19 +410,33 @@ def build_records_from_blocks(blocks: Iterable[object]) -> List[Dict[str, str]]:
 
                 if GROUP_RE.match(row_text):
                     current_group = row_text
+                    pending_severity = None
                     continue
 
                 severity_match = SEVERITY_RE.match(row_text)
                 if severity_match:
-                    if current_chunk is not None:
-                        records.append(finalize_chunk(current_chunk))
-                    current_chunk = {
-                        "group_name": current_group,
-                        "chunk_number": severity_match.group("number"),
-                        "severity_raw": normalize_severity_text(severity_match.group("severity")),
-                        "record_status": "active",
-                        "table": block.rows,
-                    }
+                    severity_text = normalize_severity_text(severity_match.group("severity"))
+                    severity_number = severity_match.group("number")
+                    if (
+                        current_chunk is not None
+                        and current_chunk.get("table") is None
+                        and current_chunk.get("severity_raw") == severity_text
+                        and (
+                            not severity_number
+                            or str(current_chunk.get("chunk_number", "")) == severity_number
+                        )
+                    ):
+                        current_chunk["table"] = block.rows
+                        pending_severity = None
+                        continue
+
+                    start_chunk(
+                        severity_number,
+                        severity_text,
+                        (pending_severity or {}).get("record_status", "active"),
+                        block.rows,
+                    )
+                    pending_severity = None
 
             if in_breach_section and current_chunk is not None and current_chunk.get("table") is None:
                 current_chunk["table"] = block.rows
@@ -596,6 +662,18 @@ def non_label_cells(row: List[str], label: str) -> List[str]:
 def normalize_severity_text(value: str) -> str:
     cleaned = re.split(r"\s*\[", value, maxsplit=1)[0]
     return normalize_inline(cleaned)
+
+
+def looks_like_severity_value(value: str) -> bool:
+    normalized = normalize_inline(value)
+    lowered = normalized.lower()
+    severity_keywords = (
+        "persistent breach",
+        "exception required",
+        "minor",
+        "temporary condition",
+    )
+    return len(normalized) <= 120 and any(keyword in lowered for keyword in severity_keywords)
 
 
 def classify_record_status(paragraph: ParagraphBlock) -> str:
