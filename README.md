@@ -18,6 +18,12 @@ Quick smoke test:
 python3 extract_breaches.py smoke_input.docx --output-dir smoke_out
 ```
 
+If a real document returns `0 breach record(s)`, inspect its internal structure:
+
+```bash
+python3 inspect_docx_structure.py your_file.docx
+```
+
 Outputs:
 
 - `out/breach_records.csv`

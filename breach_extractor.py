@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 import zipfile
@@ -138,23 +139,69 @@ def main() -> None:
 
 
 def extract_breach_records(docx_path: Path) -> List[Dict[str, str]]:
-    blocks = parse_docx_blocks(docx_path)
-    return build_records_from_blocks(blocks)
+    part_blocks = parse_docx_story_parts(docx_path)
+    primary_blocks = part_blocks.get("word/document.xml", [])
+    records = build_records_from_blocks(primary_blocks)
+    if records:
+        return records
+
+    fallback_records: List[Dict[str, str]] = []
+    for part_name, blocks in part_blocks.items():
+        if part_name == "word/document.xml":
+            continue
+        fallback_records.extend(build_records_from_blocks(blocks))
+    return dedupe_records(fallback_records)
 
 
-def parse_docx_blocks(docx_path: Path) -> List[object]:
+def parse_docx_story_parts(docx_path: Path) -> Dict[str, List[object]]:
     with zipfile.ZipFile(str(docx_path)) as archive:
-        try:
-            document_xml = archive.read("word/document.xml")
-        except KeyError:
-            raise RuntimeError("word/document.xml was not found in the DOCX.") from None
+        story_parts = relevant_story_parts(archive.namelist())
+        if "word/document.xml" not in story_parts:
+            raise RuntimeError("word/document.xml was not found in the DOCX.")
 
-    root = ET.fromstring(document_xml)
-    body = root.find("w:body", NS)
-    if body is None:
-        return []
+        parsed: Dict[str, List[object]] = {}
+        for part_name in story_parts:
+            try:
+                xml_bytes = archive.read(part_name)
+            except KeyError:
+                continue
+            root = ET.fromstring(xml_bytes)
+            body = root.find("w:body", NS)
+            container = body if body is not None else root
+            parsed[part_name] = collect_blocks(container)
+        return parsed
 
-    return collect_blocks(body)
+
+def relevant_story_parts(names: List[str]) -> List[str]:
+    selected: List[str] = []
+    excluded_exact = {
+        "word/styles.xml",
+        "word/settings.xml",
+        "word/fontTable.xml",
+        "word/numbering.xml",
+        "word/webSettings.xml",
+        "word/comments.xml",
+        "word/commentsExtended.xml",
+        "word/commentsIds.xml",
+        "word/theme/theme1.xml",
+    }
+    excluded_prefixes = (
+        "word/_rels/",
+        "word/theme/",
+    )
+
+    for name in sorted(names):
+        if not name.startswith("word/") or not name.endswith(".xml"):
+            continue
+        if name in excluded_exact:
+            continue
+        if any(name.startswith(prefix) for prefix in excluded_prefixes):
+            continue
+        basename = os.path.basename(name)
+        if basename in {"app.xml", "core.xml"}:
+            continue
+        selected.append(name)
+    return selected
 
 
 def collect_blocks(container: ET.Element) -> List[object]:
@@ -285,6 +332,24 @@ def build_records_from_blocks(blocks: Iterable[object]) -> List[Dict[str, str]]:
         records.append(finalize_chunk(current_chunk))
 
     return records
+
+
+def dedupe_records(records: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    unique: List[Dict[str, str]] = []
+    seen = set()
+    for record in records:
+        key = (
+            record.get("group_name", ""),
+            record.get("chunk_number", ""),
+            record.get("severity_raw", ""),
+            record.get("model_ids", ""),
+            record.get("model_names", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(record)
+    return unique
 
 
 def finalize_chunk(chunk: Dict[str, object]) -> Dict[str, str]:
