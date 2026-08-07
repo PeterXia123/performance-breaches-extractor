@@ -1,0 +1,16 @@
+__pycache__/
+.swift-module-cache/
+bin/
+vendor/
+*.pyc
+*.pyo
+*.json
+crop_page*.jpg
+ocr_page*.json
+screenshot_docx_test/
+first_two_rendered/
+first_two_extracted/
+smoke_out/
+build_screenshot_docx.py
+build_two_breach_tables_docx.py
+ocr_images.swift
