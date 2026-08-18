@@ -708,7 +708,7 @@ def extract_model_affected_semantic(row: List[str]) -> Dict[str, str]:
 def extract_explanation_block(rows: List[List[str]]) -> str:
     explanation_row_index = find_row_index(rows, "explanation of breach")
     if explanation_row_index == -1:
-        return ""
+        return infer_explanation_from_upper_rows(rows)
 
     parts: List[str] = []
     for index in range(explanation_row_index, len(rows)):
@@ -725,7 +725,10 @@ def extract_explanation_block(rows: List[List[str]]) -> str:
 
         parts.extend(non_empty_cells(row))
 
-    return normalize_block_text("\n".join(parts))
+    extracted = normalize_block_text("\n".join(parts))
+    if extracted:
+        return extracted
+    return infer_explanation_from_upper_rows(rows, start_index=explanation_row_index)
 
 
 def extract_breach_dates_from_rows(
@@ -736,24 +739,22 @@ def extract_breach_dates_from_rows(
         "second_breach_identified": "",
         "third_breach_identified": "",
     }
-    header_row = rows[date_header_index]
-    column_map: Dict[str, int] = {}
-    for index, header in enumerate(header_row):
-        label = normalize_inline(header).lower()
-        if "1st breach identified" in label:
-            column_map["first_breach_identified"] = index
-        elif "2nd breach identified" in label:
-            column_map["second_breach_identified"] = index
-        elif "3rd breach identified" in label:
-            column_map["third_breach_identified"] = index
+    candidate_index = find_date_value_row_index(
+        rows=rows,
+        start_index=date_header_index + 1,
+        end_index=search_end_index,
+    )
+    if candidate_index == -1:
+        return extracted
 
-    for field_name, column_index in column_map.items():
-        extracted[field_name] = find_first_date_in_column(
-            rows=rows,
-            column_index=column_index,
-            start_index=date_header_index + 1,
-            end_index=search_end_index,
-        )
+    ordered_values = extract_date_like_values(rows[candidate_index])
+    ordered_fields = (
+        "first_breach_identified",
+        "second_breach_identified",
+        "third_breach_identified",
+    )
+    for field_name, value in zip(ordered_fields, ordered_values):
+        extracted[field_name] = value
     return extracted
 
 
@@ -805,6 +806,71 @@ def find_first_date_in_column(
     if placeholder_seen:
         return "na"
     return ""
+
+
+def find_date_value_row_index(rows: List[List[str]], start_index: int, end_index: int) -> int:
+    for index in range(start_index, min(end_index, len(rows))):
+        if extract_date_like_values(rows[index]):
+            return index
+    return -1
+
+
+def extract_date_like_values(row: List[str]) -> List[str]:
+    values: List[str] = []
+    for cell in row:
+        normalized = normalize_date_like_value(cell)
+        if normalized:
+            values.append(normalized)
+    return values
+
+
+def normalize_date_like_value(value: str) -> str:
+    cleaned = clean_multiline_text(value)
+    if not cleaned:
+        return ""
+
+    for line in cleaned.splitlines():
+        normalized = normalize_inline(line)
+        if not normalized:
+            continue
+        if looks_like_date(normalized):
+            return normalized
+        if is_placeholder_value(normalized):
+            return "na"
+    return ""
+
+
+def infer_explanation_from_upper_rows(rows: List[List[str]], start_index: int = 0) -> str:
+    ignored_labels = (
+        "severity of breach identified",
+        "review of breach",
+        "model risk rating",
+        "model id",
+        "model name",
+        "model(s) affected",
+        "explanation of breach",
+        "persistent breach history",
+    )
+    candidates: List[str] = []
+    for row in rows[start_index:]:
+        for cell in row:
+            normalized = normalize_scalar(cell)
+            lowered = normalized.lower()
+            if not normalized:
+                continue
+            if any(label in lowered for label in ignored_labels):
+                continue
+            if looks_like_risk_rating(normalized):
+                continue
+            if extract_model_id_tokens(normalized):
+                continue
+            if len(normalized) < 25:
+                continue
+            candidates.append(normalized)
+
+    if not candidates:
+        return ""
+    return max(candidates, key=len)
 
 
 def find_row_index(rows: List[List[str]], needle: str) -> int:
