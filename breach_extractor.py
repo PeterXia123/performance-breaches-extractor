@@ -764,26 +764,27 @@ def extract_plan_and_remediation(rows: List[List[str]], plan_row_index: int) -> 
     }
     label_row = rows[plan_row_index]
     value_rows = rows[plan_row_index + 1 :] if plan_row_index + 1 < len(rows) else []
-    has_remediation_label = any(
-        "remediation date" in normalize_inline(cell).lower() for cell in label_row
-    )
+    remediation_column_index = find_label_column_index(label_row, "remediation date")
+    has_remediation_label = remediation_column_index != -1
 
     plan_parts: List[str] = []
-    remediation_candidates: List[str] = []
     for row in value_rows:
         if has_remediation_label:
-            if row:
-                plan_parts.extend(row[:-1])
-                remediation_candidates.append(row[-1] if len(row) >= 1 else "")
+            for index, cell in enumerate(row):
+                if index == remediation_column_index:
+                    continue
+                plan_parts.append(cell)
         else:
             plan_parts.extend(row)
 
     extracted["plan_to_address"] = normalize_block_text("\n".join(plan_parts))
-    for candidate in remediation_candidates:
-        normalized = normalize_scalar(candidate)
-        if looks_like_date(normalized):
-            extracted["remediation_date"] = normalized
-            break
+    if remediation_column_index != -1:
+        extracted["remediation_date"] = find_first_date_in_column(
+            rows=value_rows,
+            column_index=remediation_column_index,
+            start_index=0,
+            end_index=len(value_rows),
+        )
 
     return extracted
 
@@ -816,6 +817,14 @@ def find_plan_row_index(rows: List[List[str]]) -> int:
     for index, row in enumerate(rows):
         normalized = [normalize_inline(cell).lower() for cell in row]
         if any(any(target in cell for target in targets) for cell in normalized):
+            return index
+    return -1
+
+
+def find_label_column_index(row: List[str], label: str) -> int:
+    label_lower = label.lower()
+    for index, cell in enumerate(row):
+        if label_lower in normalize_inline(cell).lower():
             return index
     return -1
 
