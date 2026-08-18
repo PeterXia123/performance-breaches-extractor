@@ -46,6 +46,9 @@ PLACEHOLDER_PREFIXES = (
 BLACK_THEME_COLORS = {"text1", "tx1", "dark1", "dk1"}
 BLACK_COLOR_VALUES = {"000000", "000001", "auto"}
 MODEL_ID_TOKEN_RE = re.compile(r"\bMOD_[A-Z0-9_]+\b", re.IGNORECASE)
+DATE_TOKEN_RE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4}|\d{4}/\d{2}/\d{2})$"
+)
 OUTPUT_COLUMNS = [
     "group_name",
     "chunk_number",
@@ -343,12 +346,22 @@ def extract_grid_span(cell_element: ET.Element) -> int:
 
 
 def extract_cell_text(cell_element: ET.Element) -> str:
-    paragraphs = []
-    for paragraph_element in cell_element.findall(".//w:p", NS):
-        paragraph = parse_paragraph_block(paragraph_element)
-        if paragraph.text:
-            paragraphs.append(paragraph.text)
+    paragraphs = collect_paragraph_texts_excluding_nested_tables(cell_element)
     return "\n".join(paragraphs).strip()
+
+
+def collect_paragraph_texts_excluding_nested_tables(container: ET.Element) -> List[str]:
+    paragraphs: List[str] = []
+    for child in list(container):
+        if child.tag == W_P:
+            paragraph = parse_paragraph_block(child)
+            if paragraph.text:
+                paragraphs.append(paragraph.text)
+            continue
+        if child.tag == W_TBL:
+            continue
+        paragraphs.extend(collect_paragraph_texts_excluding_nested_tables(child))
+    return paragraphs
 
 
 def parse_int_value(value: Optional[str], default: int) -> int:
@@ -559,6 +572,9 @@ def extract_fields_from_table(rows: List[List[str]]) -> Dict[str, str]:
     if model_header_index != -1:
         model_column_map = build_model_column_map(rows[model_header_index])
 
+    date_header_index = find_row_index(rows, "1st breach identified")
+    plan_row_index = find_plan_row_index(rows)
+
     for row_index, row in enumerate(rows):
         row_lower = [normalize_inline(cell).lower() for cell in row]
 
@@ -572,16 +588,18 @@ def extract_fields_from_table(rows: List[List[str]]) -> Dict[str, str]:
             )
 
         if any("explanation of breach" in cell for cell in row_lower):
-            values = non_label_cells(row, "explanation of breach")
-            extracted["explanation_of_breach"] = normalize_block_text(" ".join(values))
+            extracted["explanation_of_breach"] = extract_explanation_value(row)
 
-    date_header_index = find_row_index(rows, "1st breach identified")
-    if date_header_index != -1 and date_header_index + 1 < len(rows):
-        header_row = rows[date_header_index]
-        value_row = rows[date_header_index + 1]
-        extracted.update(extract_breach_dates(header_row, value_row))
+    if date_header_index != -1:
+        search_end_index = plan_row_index if plan_row_index != -1 else len(rows)
+        extracted.update(
+            extract_breach_dates_from_rows(
+                rows=rows,
+                date_header_index=date_header_index,
+                search_end_index=search_end_index,
+            )
+        )
 
-    plan_row_index = find_plan_row_index(rows)
     if plan_row_index != -1:
         label_row = rows[plan_row_index]
         value_row = rows[plan_row_index + 1] if plan_row_index + 1 < len(rows) else []
@@ -681,21 +699,41 @@ def extract_model_affected_semantic(row: List[str]) -> Dict[str, str]:
     }
 
 
-def extract_breach_dates(header_row: List[str], value_row: List[str]) -> Dict[str, str]:
+def extract_explanation_value(row: List[str]) -> str:
+    values = non_label_cells(row, "explanation of breach")
+    if values:
+        return normalize_block_text("\n".join(values))
+
+    embedded_value = extract_embedded_label_value(row, "explanation of breach")
+    return normalize_block_text(embedded_value)
+
+
+def extract_breach_dates_from_rows(
+    rows: List[List[str]], date_header_index: int, search_end_index: int
+) -> Dict[str, str]:
     extracted = {
         "first_breach_identified": "",
         "second_breach_identified": "",
         "third_breach_identified": "",
     }
+    header_row = rows[date_header_index]
+    column_map: Dict[str, int] = {}
     for index, header in enumerate(header_row):
         label = normalize_inline(header).lower()
-        value = normalize_scalar(value_row[index] if index < len(value_row) else "")
         if "1st breach identified" in label:
-            extracted["first_breach_identified"] = value
+            column_map["first_breach_identified"] = index
         elif "2nd breach identified" in label:
-            extracted["second_breach_identified"] = value
+            column_map["second_breach_identified"] = index
         elif "3rd breach identified" in label:
-            extracted["third_breach_identified"] = value
+            column_map["third_breach_identified"] = index
+
+    for field_name, column_index in column_map.items():
+        extracted[field_name] = find_first_date_in_column(
+            rows=rows,
+            column_index=column_index,
+            start_index=date_header_index + 1,
+            end_index=search_end_index,
+        )
     return extracted
 
 
@@ -716,6 +754,18 @@ def extract_plan_and_remediation(label_row: List[str], value_row: List[str]) -> 
             extracted["plan_to_address"] = normalize_block_text("\n".join(value_row))
 
     return extracted
+
+
+def find_first_date_in_column(
+    rows: List[List[str]], column_index: int, start_index: int, end_index: int
+) -> str:
+    for row in rows[start_index:end_index]:
+        if column_index >= len(row):
+            continue
+        value = normalize_scalar(row[column_index])
+        if looks_like_date(value):
+            return value
+    return ""
 
 
 def find_row_index(rows: List[List[str]], needle: str) -> int:
@@ -836,6 +886,13 @@ def looks_like_risk_rating(value: str) -> bool:
 def looks_like_model_id(value: str) -> bool:
     normalized = normalize_inline(value).upper()
     return normalized.startswith("MOD_")
+
+
+def looks_like_date(value: str) -> bool:
+    normalized = normalize_scalar(value)
+    if not normalized:
+        return False
+    return bool(DATE_TOKEN_RE.match(normalized))
 
 
 def classify_record_status(paragraph: ParagraphBlock) -> str:
