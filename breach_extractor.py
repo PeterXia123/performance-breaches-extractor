@@ -792,12 +792,18 @@ def extract_plan_and_remediation(rows: List[List[str]], plan_row_index: int) -> 
 def find_first_date_in_column(
     rows: List[List[str]], column_index: int, start_index: int, end_index: int
 ) -> str:
+    placeholder_seen = False
     for row in rows[start_index:end_index]:
         if column_index >= len(row):
             continue
+        raw_value = normalize_inline(row[column_index])
+        if is_placeholder_value(raw_value):
+            placeholder_seen = True
         value = normalize_scalar(row[column_index])
         if looks_like_date(value):
             return value
+    if placeholder_seen:
+        return "na"
     return ""
 
 
@@ -956,6 +962,13 @@ def looks_like_date(value: str) -> bool:
     if not normalized:
         return False
     return bool(DATE_TOKEN_RE.match(normalized))
+
+
+def is_placeholder_value(value: str) -> bool:
+    lowered = normalize_inline(value).lower()
+    if not lowered:
+        return False
+    return any(lowered.startswith(prefix) for prefix in PLACEHOLDER_PREFIXES)
 
 
 def classify_record_status(paragraph: ParagraphBlock) -> str:
