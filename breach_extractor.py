@@ -567,15 +567,16 @@ def extract_fields_from_table(rows: List[List[str]]) -> Dict[str, str]:
         "remediation_date": "",
     }
 
-    model_header_index = find_model_header_row_index(rows)
+    persistent_history_index = find_persistent_history_row_index(rows)
+    upper_rows = rows[:persistent_history_index] if persistent_history_index != -1 else rows
+    lower_rows = rows[persistent_history_index + 1 :] if persistent_history_index != -1 else rows
+
+    model_header_index = find_model_header_row_index(upper_rows)
     model_column_map = {}
     if model_header_index != -1:
-        model_column_map = build_model_column_map(rows[model_header_index])
+        model_column_map = build_model_column_map(upper_rows[model_header_index])
 
-    date_header_index = find_row_index(rows, "1st breach identified")
-    plan_row_index = find_plan_row_index(rows)
-
-    for row_index, row in enumerate(rows):
+    for row_index, row in enumerate(upper_rows):
         row_lower = [normalize_inline(cell).lower() for cell in row]
 
         if any("model(s) affected" in cell for cell in row_lower):
@@ -587,23 +588,28 @@ def extract_fields_from_table(rows: List[List[str]]) -> Dict[str, str]:
                 )
             )
 
-        if any("explanation of breach" in cell for cell in row_lower):
-            extracted["explanation_of_breach"] = extract_explanation_value(row)
+    extracted["explanation_of_breach"] = extract_explanation_block(upper_rows)
+
+    date_header_index = find_row_index(lower_rows, "1st breach identified")
+    plan_row_index = find_plan_row_index(lower_rows)
 
     if date_header_index != -1:
-        search_end_index = plan_row_index if plan_row_index != -1 else len(rows)
+        search_end_index = plan_row_index if plan_row_index != -1 else len(lower_rows)
         extracted.update(
             extract_breach_dates_from_rows(
-                rows=rows,
+                rows=lower_rows,
                 date_header_index=date_header_index,
                 search_end_index=search_end_index,
             )
         )
 
     if plan_row_index != -1:
-        label_row = rows[plan_row_index]
-        value_row = rows[plan_row_index + 1] if plan_row_index + 1 < len(rows) else []
-        extracted.update(extract_plan_and_remediation(label_row, value_row))
+        extracted.update(
+            extract_plan_and_remediation(
+                rows=lower_rows,
+                plan_row_index=plan_row_index,
+            )
+        )
 
     return extracted
 
@@ -699,13 +705,27 @@ def extract_model_affected_semantic(row: List[str]) -> Dict[str, str]:
     }
 
 
-def extract_explanation_value(row: List[str]) -> str:
-    values = non_label_cells(row, "explanation of breach")
-    if values:
-        return normalize_block_text("\n".join(values))
+def extract_explanation_block(rows: List[List[str]]) -> str:
+    explanation_row_index = find_row_index(rows, "explanation of breach")
+    if explanation_row_index == -1:
+        return ""
 
-    embedded_value = extract_embedded_label_value(row, "explanation of breach")
-    return normalize_block_text(embedded_value)
+    parts: List[str] = []
+    for index in range(explanation_row_index, len(rows)):
+        row = rows[index]
+        if index == explanation_row_index:
+            values = non_label_cells(row, "explanation of breach")
+            if values:
+                parts.extend(values)
+            else:
+                embedded_value = extract_embedded_label_value(row, "explanation of breach")
+                if embedded_value:
+                    parts.append(embedded_value)
+            continue
+
+        parts.extend(non_empty_cells(row))
+
+    return normalize_block_text("\n".join(parts))
 
 
 def extract_breach_dates_from_rows(
@@ -737,21 +757,33 @@ def extract_breach_dates_from_rows(
     return extracted
 
 
-def extract_plan_and_remediation(label_row: List[str], value_row: List[str]) -> Dict[str, str]:
+def extract_plan_and_remediation(rows: List[List[str]], plan_row_index: int) -> Dict[str, str]:
     extracted = {
         "plan_to_address": "",
         "remediation_date": "",
     }
+    label_row = rows[plan_row_index]
+    value_rows = rows[plan_row_index + 1 :] if plan_row_index + 1 < len(rows) else []
     has_remediation_label = any(
         "remediation date" in normalize_inline(cell).lower() for cell in label_row
     )
 
-    if value_row:
-        if has_remediation_label and len(value_row) > 1:
-            extracted["plan_to_address"] = normalize_block_text("\n".join(value_row[:-1]))
-            extracted["remediation_date"] = normalize_scalar(value_row[-1])
+    plan_parts: List[str] = []
+    remediation_candidates: List[str] = []
+    for row in value_rows:
+        if has_remediation_label:
+            if row:
+                plan_parts.extend(row[:-1])
+                remediation_candidates.append(row[-1] if len(row) >= 1 else "")
         else:
-            extracted["plan_to_address"] = normalize_block_text("\n".join(value_row))
+            plan_parts.extend(row)
+
+    extracted["plan_to_address"] = normalize_block_text("\n".join(plan_parts))
+    for candidate in remediation_candidates:
+        normalized = normalize_scalar(candidate)
+        if looks_like_date(normalized):
+            extracted["remediation_date"] = normalized
+            break
 
     return extracted
 
@@ -788,6 +820,19 @@ def find_plan_row_index(rows: List[List[str]]) -> int:
     return -1
 
 
+def find_persistent_history_row_index(rows: List[List[str]]) -> int:
+    targets = (
+        "persistent breach history",
+        "applicable to lasting issues",
+        "applicable to 'lasting issues'",
+    )
+    for index, row in enumerate(rows):
+        normalized = " ".join(normalize_inline(cell).lower() for cell in row if normalize_inline(cell))
+        if any(target in normalized for target in targets):
+            return index
+    return -1
+
+
 def non_label_cells(row: List[str], label: str) -> List[str]:
     values: List[str] = []
     label_lower = label.lower()
@@ -800,6 +845,15 @@ def non_label_cells(row: List[str], label: str) -> List[str]:
             skipped = True
             continue
         values.append(normalized)
+    return values
+
+
+def non_empty_cells(row: List[str]) -> List[str]:
+    values: List[str] = []
+    for cell in row:
+        normalized = normalize_inline(cell)
+        if normalized:
+            values.append(normalized)
     return values
 
 
